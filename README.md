@@ -21,6 +21,8 @@
 
 ## Installation
 
+> ⚠️ 由于我无法注册 npm 账号，所以暂时不能以此方式安装，建议传统 `npm install`
+
 ```bash
 # Install globally via bun
 bun add -g aix-cli
