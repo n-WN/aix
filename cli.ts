@@ -52,6 +52,14 @@ function createAnimation(text: string = 'Processing') {
     process.stdout.write('\r\x1b[K\x1b[?25h');
   };
 
+  // Ensure cursor is restored on exit
+  process.on('exit', stop);
+  process.on('SIGINT', () => {
+    stop();
+    process.exit(0);
+  });
+  process.on('SIGTERM', stop);
+
   return { start, stop };
 }
 
@@ -180,17 +188,28 @@ program
   .action(async (message, options) => {
     const { provider, model: modelId } = parseModelString(options.model);
     const model = getModelInstance(provider, modelId);
-    // console.log(`Chatting with ${provider}:${modelId}...\n`);
     const animation = createAnimation('Thinking');
     animation.start();
-    if (options.stream) {
-      const result = streamText({ model, prompt: message, temperature: parseFloat(options.temperature) });
-      for await (const chunk of result.textStream) process.stdout.write(chunk);
-      console.log('\n');
-    } else {
-      const result = await generateText({ model, prompt: message, temperature: parseFloat(options.temperature) });
-      animation.stop();
-      console.log(result.text);
+    
+    try {
+      if (options.stream) {
+        const result = streamText({ model, prompt: message, temperature: parseFloat(options.temperature) });
+        let firstChunk = true;
+        for await (const chunk of result.textStream) {
+          if (firstChunk) {
+            animation.stop();
+            firstChunk = false;
+          }
+          process.stdout.write(chunk);
+        }
+        console.log('\n');
+      } else {
+        const result = await generateText({ model, prompt: message, temperature: parseFloat(options.temperature) });
+        animation.stop();
+        console.log(result.text);
+      }
+    } finally {
+      animation.stop(); // Ensure animation stops even on error/exit
     }
   });
 
@@ -261,13 +280,23 @@ program
   .action(async (prompt, options) => {
     const { provider, model: modelId } = parseModelString(options.model);
     const model = getModelInstance(provider, modelId);
-    // console.log(`Streaming with ${provider}:${modelId}...\n`);
     const animation = createAnimation('Thinking');
     animation.start();
-    const result = streamText({ model, prompt, temperature: DEFAULT_TEMPERATURE });
-    for await (const chunk of result.textStream) process.stdout.write(chunk);
-    animation.stop();
-    console.log('\n');
+    
+    try {
+      const result = streamText({ model, prompt, temperature: DEFAULT_TEMPERATURE });
+      let firstChunk = true;
+      for await (const chunk of result.textStream) {
+        if (firstChunk) {
+          animation.stop();
+          firstChunk = false;
+        }
+        process.stdout.write(chunk);
+      }
+      console.log('\n');
+    } finally {
+      animation.stop(); // Ensure animation stops even on error/exit
+    }
   });
 
 program
