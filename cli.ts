@@ -87,7 +87,7 @@ const providers = {
     baseURL: 'https://api.mistral.ai/v1',
   },
   moonshot: {
-    name: 'Kimi',
+    name: 'MoonShot AI',
     create: () => null, // Moonshot uses custom implementation
     keyEnv: 'MOONSHOT_API_KEY',
     baseURL: 'https://api.moonshot.cn/v1',
@@ -97,6 +97,7 @@ const providers = {
 // Default settings
 const DEFAULT_PROVIDER = process.env.AIX_DEFAULT_PROVIDER || 'moonshot';
 const DEFAULT_MODEL = process.env.AIX_DEFAULT_MODEL || 'kimi-k2-0711-preview';
+const DEFAULT_TEMPERATURE = 0.6;
 
 // Parse model string format: provider:model or just model
 function parseModelString(modelString: string): { provider: string; model: string } {
@@ -165,7 +166,8 @@ program
     const opts = actionCommand.opts();
     const modelOpt = opts.model || DEFAULT_MODEL;
     const { provider, model } = parseModelString(modelOpt);
-    console.log(`\x1b[2m${CLI_NAME} ${CLI_VERSION} (${provider}:${model})\x1b[0m`);
+    const providerName = providers[provider as keyof typeof providers]?.name || provider;
+    console.log(`\x1b[2m${CLI_NAME} ${CLI_VERSION} (${providerName}:${model})\x1b[0m`);
   });
 
 program
@@ -173,7 +175,7 @@ program
   .description('Chat with any OpenRouter model')
   .argument('<message>', 'Message to send to the model')
   .option('-m, --model <model>', 'Model to use', DEFAULT_MODEL)
-  .option('-t, --temperature <temp>', 'Temperature (0-1)', '0.7')
+  .option('-t, --temperature <temp>', 'Temperature (0-1)', DEFAULT_TEMPERATURE.toString())
   .option('-s, --stream', 'Stream the response')
   .action(async (message, options) => {
     const { provider, model: modelId } = parseModelString(options.model);
@@ -262,7 +264,7 @@ program
     // console.log(`Streaming with ${provider}:${modelId}...\n`);
     const animation = createAnimation('Thinking');
     animation.start();
-    const result = streamText({ model, prompt, temperature: 0.7 });
+    const result = streamText({ model, prompt, temperature: DEFAULT_TEMPERATURE });
     for await (const chunk of result.textStream) process.stdout.write(chunk);
     animation.stop();
     console.log('\n');
@@ -281,9 +283,36 @@ program
     console.log('');
     const thinkingAnimation = createAnimation('Thinking');
     thinkingAnimation.start();
+    
+    // Get system information
+    let systemInfo = '';
+    try {
+      const platform = process.platform;
+      if (platform === 'win32') {
+        // Windows system info
+        const { stdout } = await execAsync('systeminfo | findstr /B /C:"OS Name" /C:"OS Version"');
+        systemInfo = stdout.trim();
+      } else {
+        // Unix-like system info
+        const { stdout } = await execAsync('uname -a');
+        systemInfo = stdout.trim();
+      }
+    } catch (error) {
+      systemInfo = `Platform: ${process.platform}, Architecture: ${process.arch}`;
+    }
+    
     const result = await generateText({
       model,
-      prompt: `Convert this natural language to a shell command. Return ONLY the command, no explanations or markdown.\n\nNatural language: ${naturalLanguage}\n\nCommand:`,
+      prompt: `Convert this natural language to a shell command for the current system. The system information is provided below.
+
+System information:
+${systemInfo}
+
+Return ONLY the command, no explanations or markdown.
+
+Natural language: ${naturalLanguage}
+
+Command:`,
     });
     thinkingAnimation.stop();
     const command = result.text.trim();

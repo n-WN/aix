@@ -1,8 +1,35 @@
 {
-  "name": "aix",
+  "name": "aix-cli",
+  "version": "1.0.0",
+  "description": "AI CLI tool for multiple providers",
   "module": "index.ts",
   "type": "module",
-  "private": true,
+  "bin": {
+    "aix": "./cli.ts"
+  },
+  "files": [
+    "cli.ts",
+    "index.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "ai",
+    "cli",
+    "openrouter",
+    "deepseek",
+    "groq",
+    "mistral",
+    "kimi"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/aix-cli.git"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
   "devDependencies": {
     "@types/bun": "latest",
     "@types/commander": "^2.12.5",

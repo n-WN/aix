@@ -1,4 +1,4 @@
-# aix
+# aix-cli
 
 <div align="center">
 
@@ -16,6 +16,18 @@
 </div>
 
 > **AI Programming Challenge**: This CLI tool was built as part of an AI programming interview, demonstrating real-world AI integration patterns and CLI development practices. Inspired by [rauchg's post](https://x.com/rauchg/status/1949680770274246978) showcasing elegant AI-powered terminal experiences.
+>
+> **AI CLI Tool**: Convert natural language to shell commands with AI-powered assistance. Built with Bun and TypeScript for maximum performance.
+
+## Installation
+
+```bash
+# Install globally via bun
+bun add -g aix-cli
+
+# Or via npm
+npm install -g aix-cli
+```
 
 ## Features
 
@@ -25,12 +37,13 @@
 - **Modern Terminal UI**: Clean output formatting
 - **File Context Support**: Ask questions about files with intelligent context injection
 - **Natural Language to Shell**: Convert plain English to executable commands
+- **System-aware**: Automatically detects OS and provides context-aware commands
 
 ## Quick Start
 
 ```bash
-# Install dependencies
-bun install
+# Install globally
+bun add -g aix-cli
 
 # Set your API keys
 export MOONSHOT_API_KEY="your-moonshot-key"
@@ -39,17 +52,11 @@ export DEEPSEEK_API_KEY="your-deepseek-key"
 export GROQ_API_KEY="your-groq-key"
 export MISTRAL_API_KEY="your-mistral-key"
 
-# Start chatting
-bun cli.ts chat "Hello, how can I help you today?"
-
-# List all available models
-bun cli.ts models
-
-# Ask about a file
-bun cli.ts ask index.ts "What does this code do?"
-
-# Convert natural language to shell commands
-bun cli.ts exec "find all typescript files modified today"
+# Start using
+aix chat "Hello, how can I help you today?"
+aix models
+aix ask package.json "What dependencies does this project use?"
+aix exec "find all typescript files modified today"
 ```
 
 ## Commands
@@ -58,28 +65,30 @@ bun cli.ts exec "find all typescript files modified today"
 Chat with any AI model with optional streaming and temperature control.
 
 ```bash
-bun cli.ts chat "Explain quantum computing" -m deepseek/deepseek-reasoner -t 0.8 -s
+aix chat "Explain quantum computing" -m deepseek/deepseek-reasoner -t 0.8 -s
 ```
 
 ### `ask [file] [question]`
 Ask questions about files with intelligent context injection.
 
 ```bash
-bun cli.ts ask package.json "What dependencies does this project use?"
+aix ask package.json "What dependencies does this project use?"
 ```
 
 ### `stream [prompt]`
 Stream responses in real-time with terminal animations.
 
 ```bash
-bun cli.ts stream "Write a short story about AI"
+aix stream "Write a short story about AI"
 ```
 
 ### `exec [natural-language]`
-Convert natural language to shell commands with safety checks.
+Convert natural language to shell commands with safety checks and system-aware context.
 
 ```bash
-bun cli.ts exec "create a backup of all js files in src"
+aix exec "create a backup of all js files in src"
+aix exec "find large files on macOS"
+aix exec "show system information"
 ```
 
 ### `models`
@@ -124,16 +133,21 @@ This project demonstrates several advanced AI integration patterns:
 
 ```bash
 # Creative writing with different models
-bun cli.ts chat "Write a haiku about coding" -m anthropic/claude-sonnet-4
+aix chat "Write a haiku about coding" -m anthropic/claude-sonnet-4
 
 # Technical questions with reasoning models
-bun cli.ts chat "Explain async/await in JavaScript" -m deepseek/deepseek-reasoner
+aix chat "Explain async/await in JavaScript" -m deepseek/deepseek-reasoner
 
 # File analysis
-bun cli.ts ask cli.ts "What safety features does this CLI implement?"
+aix ask cli.ts "What safety features does this CLI implement?"
 
 # Batch operations
-bun cli.ts exec "find all TypeScript files and count lines of code"
+aix exec "find all TypeScript files and count lines of code"
+
+# System-specific commands
+aix exec "show disk usage on macOS"
+aix exec "list all installed packages on Ubuntu"
+aix exec "find large files on Windows"
 ```
 
 ## Environment Variables
