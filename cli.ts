@@ -311,7 +311,7 @@ program
   .argument('<natural-language>', 'Natural language description of what you want to do')
   .option('-m, --model <model>', 'Model to use', DEFAULT_MODEL)
   .option('-y, --yes', 'Skip confirmation prompt')
-  .option('--vocab', '启用“执行中学单词”显示（一次LLM返回，含词条）')
+  .option('--vocab', '启用“执行中学单词”显示（仅对用户输入与LLM解释生效）')
   .action(async (naturalLanguage, options) => {
     const { provider, model: modelId } = parseModelString(options.model);
     const model = getModelInstance(provider, modelId);
@@ -347,34 +347,103 @@ program
       gray: (s: string) => `\x1b[90m${s}\x1b[39m`,
     };
 
-    // 渲染词汇（一次LLM返回的 vocab 字段）
-    function renderVocab(items: { word: string; ipa: string; cn: string; ex: string }[]) {
-      if (!Array.isArray(items) || items.length === 0) return;
+    // 简易英文单词提取（排除数字/短连词/常见功能词），配合 LLM 生成词条
+    const COMMON_WORDS = new Set([
+      'the','a','an','in','on','at','of','for','to','from','by','and','or','but','as','is','are','was','were','be','been','being','with','this','that','these','those',
+      'i','you','he','she','it','we','they','me','him','her','us','them','my','your','his','her','its','our','their',
+      'do','does','did','done','have','has','had','will','would','can','could','shall','should','may','might','must',
+      'not','no','yes','if','then','than','so','very','more','most','much','many','some','any','all','few','lot','lots','there','here','how','what','when','where','why','who','which',
+      'up','down','left','right','into','over','under','out','off','again','new','old','good','bad'
+    ]);
+    function extractCandidateWords(text: string): string[] {
+      if (!text) return [];
+      const tokens = Array.from(text.matchAll(/[A-Za-z][A-Za-z'-]{2,}/g)).map(m => m[0].toLowerCase());
+      const filtered = tokens.filter(w =>
+        w.length >= 5 && // 简易规则：长度≥5
+        !COMMON_WORDS.has(w) &&
+        !/^[a-z]-/.test(w) // 排除某些参数式片段
+      );
+      // 去重
+      return Array.from(new Set(filtered)).slice(0, 30); // 上限，避免过量
+    }
+
+    async function showVocabBlock(title: string, words: string[], modelRef: any) {
+      if (!words || words.length === 0) return;
       console.log(color.dim('─'.repeat(60)));
-      console.log(color.cyan(color.bold(`[Vocab] 英语词汇`)));
+      console.log(color.cyan(color.bold(`[Vocab] ${title}`)));
+      // 使用当前模型生成词条(JSON Mode在 moonshot 下更稳；其他provider使用文本模式也可解析行)
+      // 约束单行输出：单词 | 音标 | 释义 | 例句
+      const vocabSystem = `
+你是一个英汉词典助手。仅输出多行，每行一个词条，格式严格如下（不额外输出其他说明）：
+word | [IPA] | 中文释义 | 例句（英文，含该词）
+要求：
+- 仅处理提供的单词列表，按输入顺序输出
+- IPA 采用通用音标，不要加“英/美”字样
+- 例句尽量简短自然
+- 每个词一行，使用竖线分隔，避免换行
+`.trim();
+      const vocabUser = `单词列表：\n${words.join(', ')}`;
+      try {
+        const out = await generateText({
+          model: modelRef,
+          system: vocabSystem,
+          prompt: vocabUser,
+          temperature: 0.2,
+        });
+        const lines = out.text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        // 计算列宽以实现对齐（保持例句左对齐）
+        const parsed = lines.map(line => {
+          const parts = line.split('|').map(s => s.trim());
+          if (parts.length >= 4) {
+            const [w, ipa, zh, ex] = parts;
+            return { w, ipa, zh, ex };
+          }
+          return null;
+        }).filter(Boolean) as { w: string; ipa: string; zh: string; ex: string }[];
 
-      // 统计列宽（不含 ANSI）
-      const visibleLen = (s: string) => (s ?? '').toString().replace(/\x1b\[[0-9;]*m/g, '').length;
-      const maxW = Math.max(4, ...items.map(r => visibleLen(r.word)));
-      const maxI = Math.max(4, ...items.map(r => visibleLen(r.ipa)));
-      const maxZ = Math.max(4, ...items.map(r => visibleLen(r.cn)));
+        // 统计最大宽度（不含 ANSI）
+        const visibleLen = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '').length;
+        const maxW = Math.max(4, ...parsed.map(r => visibleLen(r.w)));
+        const maxI = Math.max(4, ...parsed.map(r => visibleLen(r.ipa)));
+        const maxZ = Math.max(4, ...parsed.map(r => visibleLen(r.zh)));
 
-      const colW = Math.max(12, Math.min(22, maxW));
-      const colI = Math.max(10, Math.min(22, maxI));
-      const colZ = Math.max(16, Math.min(30, maxZ));
+        // 固定最小宽度，避免过窄
+        const colW = Math.max(12, Math.min(22, maxW));
+        const colI = Math.max(10, Math.min(22, maxI));
+        const colZ = Math.max(16, Math.min(30, maxZ));
 
-      const padTo = (s: string, n: number) => {
-        const len = visibleLen(s);
-        return s + ' '.repeat(Math.max(1, n - len));
-      };
+        const padTo = (s: string, n: number) => {
+          const len = visibleLen(s);
+          return s + ' '.repeat(Math.max(1, n - len));
+        };
 
-      for (const r of items) {
-        const colWord = padTo(color.bold(r.word || ''), colW);
-        const colIpa = padTo(color.magenta(r.ipa || ''), colI);
-        const colZh = padTo(r.cn || '', colZ);
-        console.log(`${colWord} ${colIpa} ${colZh} ${color.gray('例句:')} ${r.ex || ''}`);
+        for (const r of parsed) {
+          const colWord = padTo(color.bold(r.w), colW);
+          const colIpa = padTo(color.magenta(r.ipa), colI);
+          const colZh = padTo(r.zh, colZ);
+          // 例句始终紧随“例句:”后开始，确保左对齐
+          console.log(`${colWord} ${colIpa} ${colZh} ${color.gray('例句:')} ${r.ex}`);
+        }
+
+        // 打印无法解析成四段的原始行
+        for (const line of lines) {
+          const parts = line.split('|').map(s => s.trim());
+          if (parts.length < 4) console.log(line);
+        }
+      } catch (e) {
+        // 回退打印
+        console.log(color.yellow('[vocab] 词条生成失败，原始内容：'));
+        console.log((e as Error).message || String(e));
       }
       console.log(color.dim('─'.repeat(60)));
+    }
+
+    // Vocab: 用户输入词汇（仅在 --vocab 时展示）
+    if (options.vocab) {
+      const inputWords = extractCandidateWords(naturalLanguage);
+      if (inputWords.length > 0) {
+        await showVocabBlock('来自输入', inputWords, model);
+      }
     }
 
     // 如果是 Moonshot/Kimi，使用 JSON Mode（chat.completions + response_format: json_object）
@@ -382,24 +451,20 @@ program
       // 使用 OpenAI 兼容接口：messages + response_format
       const systemPrompt = `
 You are a command generator and security analyzer for shell commands.
-Return ONLY a valid JSON Object (no markdown, no extra text) with EXACT fields:
+You must output ONLY a valid JSON Object (no markdown, no extra text) with EXACT fields:
 {
   "command": "string",
   "explanation": "string",
   "arguments": [{"arg":"string","reason":"string"}],
-  "dangerLevel": 1,
-  "vocab": [{"word":"string","ipa":"string","cn":"string","ex":"string"}]
+  "dangerLevel": 1
 }
 Rules:
-- Top-level MUST be a JSON Object (not array or others).
-- Produce a minimal, safe command for the user's intent.
+- Output must be a JSON Object, not array or other types.
+- Provide a minimal, safe command for the user's intent.
 - Explain each argument in 'arguments'.
 - Set dangerLevel in [1..5], where 5 is very dangerous.
 - Never pipe remote content into a shell (e.g. curl ... | sh).
 - Prefer non-destructive options by default.
-- Build vocab from user's input + your explanation + arguments.reason:
-  * Include words above primary-school level (e.g., length≥5 and non-function words)
-  * For each item: word, IPA (no “UK/US” label), concise Chinese meaning, and a short natural English sentence using the word.
 - Adapt to system info below.
 System: ${systemInfo}
       `.trim();
@@ -411,8 +476,7 @@ System: ${systemInfo}
 User Intent:
 ${naturalLanguage}
 
-Return ONLY the JSON object with fields: command, explanation, arguments, dangerLevel, vocab.
-If no vocab found, set "vocab":[]
+Return ONLY the JSON object with fields: command, explanation, arguments, dangerLevel.
       `.trim();
 
       const result = await generateText({
@@ -427,7 +491,7 @@ If no vocab found, set "vocab":[]
       thinkingAnimation.stop();
 
       // 解析 JSON
-      let parsed: { command: string; explanation: string; arguments: { arg: string; reason: string }[]; dangerLevel: number; vocab?: { word: string; ipa: string; cn: string; ex: string }[] };
+      let parsed: { command: string; explanation: string; arguments: { arg: string; reason: string }[]; dangerLevel: number };
       try {
         parsed = JSON.parse(result.text.trim());
       } catch {
@@ -454,6 +518,22 @@ If no vocab found, set "vocab":[]
         console.log('Explanation:');
         console.log(parsed.explanation);
         console.log('');
+        // Vocab: LLM 解释中的词汇（仅在 --vocab 时展示）
+        if (options.vocab) {
+          const wordsFromLLM = extractCandidateWords(parsed.explanation);
+          // 追加参数说明文本
+          if (Array.isArray(parsed.arguments)) {
+            for (const item of parsed.arguments) {
+              if (item?.reason) {
+                wordsFromLLM.push(...extractCandidateWords(item.reason));
+              }
+            }
+          }
+          const unique = Array.from(new Set(wordsFromLLM));
+          if (unique.length > 0) {
+            await showVocabBlock('来自LLM解释', unique, model);
+          }
+        }
       }
       if (Array.isArray(parsed.arguments) && parsed.arguments.length > 0) {
         console.log('Arguments:');
@@ -463,11 +543,6 @@ If no vocab found, set "vocab":[]
           console.log(`  - ${color.bold(arg)}: ${reason}`);
         }
         console.log('');
-      }
-
-      // 词汇展示（一次返回的 vocab）
-      if (options.vocab && Array.isArray(parsed.vocab) && parsed.vocab.length > 0) {
-        renderVocab(parsed.vocab);
       }
 
       // 打印危险等级（≥4 用红色警告）
@@ -570,7 +645,7 @@ ${naturalLanguage}
     const result = await generateText({ model, prompt, temperature: 0 });
     thinkingAnimation.stop();
 
-    let parsed: { command: string; explanation: string; arguments: { arg: string; reason: string }[]; dangerLevel: number; vocab?: { word: string; ipa: string; cn: string; ex: string }[] };
+    let parsed: { command: string; explanation: string; arguments: { arg: string; reason: string }[]; dangerLevel: number };
     try {
       parsed = JSON.parse(result.text.trim());
     } catch {
@@ -595,6 +670,21 @@ ${naturalLanguage}
       console.log('Explanation:');
       console.log(parsed.explanation);
       console.log('');
+      // Vocab: LLM 解释中的词汇（仅在 --vocab 时展示）
+      if (options.vocab) {
+        const wordsFromLLM = extractCandidateWords(parsed.explanation);
+        if (Array.isArray(parsed.arguments)) {
+          for (const item of parsed.arguments) {
+            if (item?.reason) {
+              wordsFromLLM.push(...extractCandidateWords(item.reason));
+            }
+          }
+        }
+        const unique = Array.from(new Set(wordsFromLLM));
+        if (unique.length > 0) {
+          await showVocabBlock('来自LLM解释', unique, model);
+        }
+      }
     }
     if (Array.isArray(parsed.arguments) && parsed.arguments.length > 0) {
       console.log('Arguments:');
@@ -604,11 +694,6 @@ ${naturalLanguage}
         console.log(`  - ${color.bold(arg)}: ${reason}`);
       }
       console.log('');
-    }
-
-    // 词汇展示（一次返回的 vocab）
-    if (options.vocab && Array.isArray(parsed.vocab) && parsed.vocab.length > 0) {
-      renderVocab(parsed.vocab);
     }
 
     const dangerLine = `Danger Level: ${finalDanger} (1~5)`;
