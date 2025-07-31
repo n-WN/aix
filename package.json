@@ -1,5 +1,5 @@
 {
-  "name": "aix-cli",
+  "name": "aix-ai",
   "version": "1.0.0",
   "description": "AI CLI tool for multiple providers",
   "module": "index.ts",

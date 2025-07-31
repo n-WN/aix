@@ -311,6 +311,7 @@ program
   .argument('<natural-language>', 'Natural language description of what you want to do')
   .option('-m, --model <model>', 'Model to use', DEFAULT_MODEL)
   .option('-y, --yes', 'Skip confirmation prompt')
+  .option('--vocab', '启用“执行中学单词”显示（一次LLM返回，含词条）')
   .action(async (naturalLanguage, options) => {
     const { provider, model: modelId } = parseModelString(options.model);
     const model = getModelInstance(provider, modelId);
@@ -339,29 +340,66 @@ program
       red: (s: string) => `\x1b[31m${s}\x1b[39m`,
       yellow: (s: string) => `\x1b[33m${s}\x1b[39m`,
       green: (s: string) => `\x1b[32m${s}\x1b[39m`,
+      cyan: (s: string) => `\x1b[36m${s}\x1b[39m`,
+      magenta: (s: string) => `\x1b[35m${s}\x1b[39m`,
       bold: (s: string) => `\x1b[1m${s}\x1b[22m`,
       dim: (s: string) => `\x1b[2m${s}\x1b[22m`,
+      gray: (s: string) => `\x1b[90m${s}\x1b[39m`,
     };
+
+    // 渲染词汇（一次LLM返回的 vocab 字段）
+    function renderVocab(items: { word: string; ipa: string; cn: string; ex: string }[]) {
+      if (!Array.isArray(items) || items.length === 0) return;
+      console.log(color.dim('─'.repeat(60)));
+      console.log(color.cyan(color.bold(`[Vocab] 英语词汇`)));
+
+      // 统计列宽（不含 ANSI）
+      const visibleLen = (s: string) => (s ?? '').toString().replace(/\x1b\[[0-9;]*m/g, '').length;
+      const maxW = Math.max(4, ...items.map(r => visibleLen(r.word)));
+      const maxI = Math.max(4, ...items.map(r => visibleLen(r.ipa)));
+      const maxZ = Math.max(4, ...items.map(r => visibleLen(r.cn)));
+
+      const colW = Math.max(12, Math.min(22, maxW));
+      const colI = Math.max(10, Math.min(22, maxI));
+      const colZ = Math.max(16, Math.min(30, maxZ));
+
+      const padTo = (s: string, n: number) => {
+        const len = visibleLen(s);
+        return s + ' '.repeat(Math.max(1, n - len));
+      };
+
+      for (const r of items) {
+        const colWord = padTo(color.bold(r.word || ''), colW);
+        const colIpa = padTo(color.magenta(r.ipa || ''), colI);
+        const colZh = padTo(r.cn || '', colZ);
+        console.log(`${colWord} ${colIpa} ${colZh} ${color.gray('例句:')} ${r.ex || ''}`);
+      }
+      console.log(color.dim('─'.repeat(60)));
+    }
 
     // 如果是 Moonshot/Kimi，使用 JSON Mode（chat.completions + response_format: json_object）
     if (provider === 'moonshot') {
       // 使用 OpenAI 兼容接口：messages + response_format
       const systemPrompt = `
 You are a command generator and security analyzer for shell commands.
-You must output ONLY a valid JSON Object (no markdown, no extra text) with EXACT fields:
+Return ONLY a valid JSON Object (no markdown, no extra text) with EXACT fields:
 {
   "command": "string",
   "explanation": "string",
   "arguments": [{"arg":"string","reason":"string"}],
-  "dangerLevel": 1
+  "dangerLevel": 1,
+  "vocab": [{"word":"string","ipa":"string","cn":"string","ex":"string"}]
 }
 Rules:
-- Output must be a JSON Object, not array or other types.
-- Provide a minimal, safe command for the user's intent.
+- Top-level MUST be a JSON Object (not array or others).
+- Produce a minimal, safe command for the user's intent.
 - Explain each argument in 'arguments'.
 - Set dangerLevel in [1..5], where 5 is very dangerous.
 - Never pipe remote content into a shell (e.g. curl ... | sh).
 - Prefer non-destructive options by default.
+- Build vocab from user's input + your explanation + arguments.reason:
+  * Include words above primary-school level (e.g., length≥5 and non-function words)
+  * For each item: word, IPA (no “UK/US” label), concise Chinese meaning, and a short natural English sentence using the word.
 - Adapt to system info below.
 System: ${systemInfo}
       `.trim();
@@ -373,7 +411,8 @@ System: ${systemInfo}
 User Intent:
 ${naturalLanguage}
 
-Return ONLY the JSON object with fields: command, explanation, arguments, dangerLevel.
+Return ONLY the JSON object with fields: command, explanation, arguments, dangerLevel, vocab.
+If no vocab found, set "vocab":[]
       `.trim();
 
       const result = await generateText({
@@ -388,7 +427,7 @@ Return ONLY the JSON object with fields: command, explanation, arguments, danger
       thinkingAnimation.stop();
 
       // 解析 JSON
-      let parsed: { command: string; explanation: string; arguments: { arg: string; reason: string }[]; dangerLevel: number };
+      let parsed: { command: string; explanation: string; arguments: { arg: string; reason: string }[]; dangerLevel: number; vocab?: { word: string; ipa: string; cn: string; ex: string }[] };
       try {
         parsed = JSON.parse(result.text.trim());
       } catch {
@@ -419,11 +458,16 @@ Return ONLY the JSON object with fields: command, explanation, arguments, danger
       if (Array.isArray(parsed.arguments) && parsed.arguments.length > 0) {
         console.log('Arguments:');
         for (const item of parsed.arguments) {
-          const arg = item?.arg ?? '';
-          const reason = item?.reason ?? '';
+          const arg = (item && typeof item.arg === 'string') ? item.arg : '';
+          const reason = (item && typeof item.reason === 'string') ? item.reason : '';
           console.log(`  - ${color.bold(arg)}: ${reason}`);
         }
         console.log('');
+      }
+
+      // 词汇展示（一次返回的 vocab）
+      if (options.vocab && Array.isArray(parsed.vocab) && parsed.vocab.length > 0) {
+        renderVocab(parsed.vocab);
       }
 
       // 打印危险等级（≥4 用红色警告）
@@ -526,7 +570,7 @@ ${naturalLanguage}
     const result = await generateText({ model, prompt, temperature: 0 });
     thinkingAnimation.stop();
 
-    let parsed: { command: string; explanation: string; arguments: { arg: string; reason: string }[]; dangerLevel: number };
+    let parsed: { command: string; explanation: string; arguments: { arg: string; reason: string }[]; dangerLevel: number; vocab?: { word: string; ipa: string; cn: string; ex: string }[] };
     try {
       parsed = JSON.parse(result.text.trim());
     } catch {
@@ -555,11 +599,16 @@ ${naturalLanguage}
     if (Array.isArray(parsed.arguments) && parsed.arguments.length > 0) {
       console.log('Arguments:');
       for (const item of parsed.arguments) {
-        const arg = item?.arg ?? '';
-        const reason = item?.reason ?? '';
+        const arg = (item && typeof item.arg === 'string') ? item.arg : '';
+        const reason = (item && typeof item.reason === 'string') ? item.reason : '';
         console.log(`  - ${color.bold(arg)}: ${reason}`);
       }
       console.log('');
+    }
+
+    // 词汇展示（一次返回的 vocab）
+    if (options.vocab && Array.isArray(parsed.vocab) && parsed.vocab.length > 0) {
+      renderVocab(parsed.vocab);
     }
 
     const dangerLine = `Danger Level: ${finalDanger} (1~5)`;
