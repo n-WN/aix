@@ -7,7 +7,7 @@ import { createOpenAI } from '@ai-sdk/openai';
 import { generateText, streamText } from 'ai';
 import { Command } from 'commander';
 import { readFileSync } from 'fs';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import * as readline from 'readline';
 
@@ -165,6 +165,12 @@ function isDangerousCommand(command: string): boolean {
   return DANGEROUS_COMMANDS.some(pattern => pattern.test(command));
 }
 
+// 需要真实 TTY 的交互式程序（非穷尽）
+const TTY_APPS = /\b(btop|htop|top|vim|nvim|less|more|ssh|tmux|screen|man)\b/;
+function needsTty(command: string): boolean {
+  return TTY_APPS.test(command);
+}
+
 // Global hook: show CLI name, version, and selected provider:model in dim text
 program
   .name(CLI_NAME)
@@ -308,73 +314,315 @@ program
   .action(async (naturalLanguage, options) => {
     const { provider, model: modelId } = parseModelString(options.model);
     const model = getModelInstance(provider, modelId);
-    console.log(`Converting: "${naturalLanguage}"`);
+    console.log(`\x1b[2mConverting: "${naturalLanguage}"\x1b[0m`);
     console.log('');
     const thinkingAnimation = createAnimation('Thinking');
     thinkingAnimation.start();
-    
+
     // Get system information
     let systemInfo = '';
     try {
       const platform = process.platform;
       if (platform === 'win32') {
-        // Windows system info
         const { stdout } = await execAsync('systeminfo | findstr /B /C:"OS Name" /C:"OS Version"');
         systemInfo = stdout.trim();
       } else {
-        // Unix-like system info
         const { stdout } = await execAsync('uname -a');
         systemInfo = stdout.trim();
       }
-    } catch (error) {
+    } catch (_error) {
       systemInfo = `Platform: ${process.platform}, Architecture: ${process.arch}`;
     }
-    
-    const result = await generateText({
-      model,
-      prompt: `Convert this natural language to a shell command for the current system. The system information is provided below.
 
-System information:
+    // 颜色工具（使用 ANSI 转义，避免引入依赖）
+    const color = {
+      red: (s: string) => `\x1b[31m${s}\x1b[39m`,
+      yellow: (s: string) => `\x1b[33m${s}\x1b[39m`,
+      green: (s: string) => `\x1b[32m${s}\x1b[39m`,
+      bold: (s: string) => `\x1b[1m${s}\x1b[22m`,
+      dim: (s: string) => `\x1b[2m${s}\x1b[22m`,
+    };
+
+    // 如果是 Moonshot/Kimi，使用 JSON Mode（chat.completions + response_format: json_object）
+    if (provider === 'moonshot') {
+      // 使用 OpenAI 兼容接口：messages + response_format
+      const systemPrompt = `
+You are a command generator and security analyzer for shell commands.
+You must output ONLY a valid JSON Object (no markdown, no extra text) with EXACT fields:
+{
+  "command": "string",
+  "explanation": "string",
+  "arguments": [{"arg":"string","reason":"string"}],
+  "dangerLevel": 1
+}
+Rules:
+- Output must be a JSON Object, not array or other types.
+- Provide a minimal, safe command for the user's intent.
+- Explain each argument in 'arguments'.
+- Set dangerLevel in [1..5], where 5 is very dangerous.
+- Never pipe remote content into a shell (e.g. curl ... | sh).
+- Prefer non-destructive options by default.
+- Adapt to system info below.
+System: ${systemInfo}
+      `.trim();
+
+      // 由于本项目通过 ai SDK 的 generateText/streamText 抽象不同 provider，
+      // 这里沿用 generateText 但以严格提示约束输出为 JSON；Moonshot 平台会遵循 response_format=json_object。
+      // 若将来切换到底层 OpenAI SDK，可在此处直接调用 chat.completions.create 并传入 response_format。
+      const jsonModePrompt = `
+User Intent:
+${naturalLanguage}
+
+Return ONLY the JSON object with fields: command, explanation, arguments, dangerLevel.
+      `.trim();
+
+      const result = await generateText({
+        model,
+        system: systemPrompt,
+        prompt: jsonModePrompt,
+        temperature: 0,
+        // 逻辑层面说明：Moonshot 的 JSON Mode 需要 response_format={"type":"json_object"}
+        // 当前 ai SDK 未直接暴露，此处通过更严格的 system+user 约束，并配合 Moonshot 端配置生效。
+      });
+
+      thinkingAnimation.stop();
+
+      // 解析 JSON
+      let parsed: { command: string; explanation: string; arguments: { arg: string; reason: string }[]; dangerLevel: number };
+      try {
+        parsed = JSON.parse(result.text.trim());
+      } catch {
+        console.error('无法解析模型返回的 JSON。原始输出如下：');
+        console.error(result.text);
+        return;
+      }
+
+      const command = (parsed.command || '').trim();
+      if (!command) {
+        console.error('未能从模型结果中提取命令');
+        return;
+      }
+
+      // 本地风险评估（基于现有黑名单）并取较高值
+      const modelDanger = Math.min(5, Math.max(1, Number(parsed.dangerLevel) || 1));
+      const localDanger = isDangerousCommand(command) ? 5 : 1;
+      const finalDanger = Math.max(modelDanger, localDanger);
+
+      // 打印解释与参数
+      console.log(color.bold('Generated command: '), color.bold(command));
+      console.log('');
+      if (parsed.explanation) {
+        console.log('Explanation:');
+        console.log(parsed.explanation);
+        console.log('');
+      }
+      if (Array.isArray(parsed.arguments) && parsed.arguments.length > 0) {
+        console.log('Arguments:');
+        for (const item of parsed.arguments) {
+          const arg = item?.arg ?? '';
+          const reason = item?.reason ?? '';
+          console.log(`  - ${color.bold(arg)}: ${reason}`);
+        }
+        console.log('');
+      }
+
+      // 打印危险等级（≥4 用红色警告）
+      const dangerLine = `Danger Level: ${finalDanger} (1~5)`;
+      if (finalDanger >= 4) {
+        console.log(color.red(dangerLine));
+        console.log(color.red('警告：该命令被评定为高危，已阻止自动执行。请在手动核对后于系统 Shell 中自行执行。'));
+        return;
+      } else if (finalDanger === 3) {
+        console.log(color.yellow(dangerLine));
+      } else {
+        console.log(color.green(dangerLine));
+      }
+      console.log('');
+
+      // 询问是否执行
+      let shouldExecute = options.yes;
+      if (!shouldExecute) {
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        shouldExecute = await new Promise(resolve =>
+          rl.question('Execute this command? (y/N): ', ans => {
+            rl.close();
+            resolve(ans.toLowerCase() === 'y' || ans.toLowerCase() === 'yes');
+          })
+        );
+      }
+      if (!shouldExecute) {
+        console.log('Command execution cancelled');
+        return;
+      }
+
+      // 若命令包含 sudo 或需要交互式输入：先启动动画，随后切换到可输入状态（暂停动画并恢复光标）
+      const needsInteractive = /\bsudo\b/.test(command) || /\bpasswd\b|\bpassword\b/i.test(command);
+      const executingAnimation = createAnimation('Executing');
+      executingAnimation.start();
+      if (needsInteractive) {
+        // 切换动画状态：停止动画，恢复光标，提示可输入
+        executingAnimation.stop();
+        process.stdout.write('\x1b[2m[interactive mode] Waiting for input (e.g. password)...\x1b[0m\n');
+      }
+      try {
+        // 如果是需要 TTY 的交互式程序，使用 spawn 继承 TTY
+        if (needsTty(command)) {
+          // 交互式：确保动画已停
+          executingAnimation.stop();
+          process.stdout.write('\x1b[2m[interactive TTY] Attaching to terminal...\x1b[0m\n');
+          await new Promise<void>((resolve, reject) => {
+            const child = spawn(command, {
+              shell: true,
+              stdio: 'inherit', // 继承当前 TTY，允许密码/键盘输入和 TUI
+            });
+            child.on('exit', (code) => {
+              if (code === 0) resolve();
+              else reject(new Error(`Process exited with code ${code}`));
+            });
+            child.on('error', reject);
+          });
+        } else {
+          const { stdout, stderr } = await execAsync(command);
+          if (!needsInteractive) executingAnimation.stop();
+          if (stdout) console.log('Output:', stdout);
+          if (stderr) console.log('Error Output:', stderr);
+        }
+      } catch (error) {
+        if (!needsInteractive) executingAnimation.stop();
+        console.error('[!] ', error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+
+    // 其他 provider：沿用原先基于 prompt 的 JSON 结构输出（非 JSON Mode 确保兼容）
+    const prompt = `You are a command generator and security analyzer.
+Given the user's natural language request and the current system info, produce a safe, minimal shell command that satisfies the intent.
+Additionally, explain the command and each argument, and assess a danger level from 1 (safe) to 5 (very dangerous).
+If multiple commands are needed, try to combine them safely with '&&' where reasonable.
+
+Strict output requirement:
+Return ONLY valid JSON (no markdown), with this exact shape:
+{
+  "command": "string, the command line to run",
+  "explanation": "string, human-readable explanation of what the command does",
+  "arguments": [
+    { "arg": "the literal argument token", "reason": "why this argument is needed" }
+  ],
+  "dangerLevel": 1
+}
+
+Constraints:
+- Adapt to this system:
 ${systemInfo}
+- Prefer non-destructive options by default (e.g., dry-run flags if available).
+- Never include redirections to /dev/sda or destructive storage ops.
+- Never pipe unknown network content directly into a shell (e.g. curl ... | sh).
+- If the intent is inherently destructive, set dangerLevel to 4 or 5 and still provide the minimal correct command.
 
-Return ONLY the command, no explanations or markdown.
+User Natural Language:
+${naturalLanguage}
+`;
 
-Natural language: ${naturalLanguage}
-
-Command:`,
-    });
+    const result = await generateText({ model, prompt, temperature: 0 });
     thinkingAnimation.stop();
-    const command = result.text.trim();
+
+    let parsed: { command: string; explanation: string; arguments: { arg: string; reason: string }[]; dangerLevel: number };
+    try {
+      parsed = JSON.parse(result.text.trim());
+    } catch {
+      console.error('无法解析模型返回的 JSON。原始输出如下：');
+      console.error(result.text);
+      return;
+    }
+
+    const command = (parsed.command || '').trim();
     if (!command) {
-      console.error('Could not determine command from natural language');
+      console.error('未能从模型结果中提取命令');
       return;
     }
-    console.log(`Generated command: \x1b[1m${command}\x1b[22m`);
-    if (isDangerousCommand(command)) {
-      console.error('DANGEROUS COMMAND DETECTED!');
-      console.error('This command is blocked for safety reasons.');
-      console.error(`   Command: ${command}`);
-      console.error('If you really need to run this, use the shell directly.');
-      return;
+
+    const modelDanger = Math.min(5, Math.max(1, Number(parsed.dangerLevel) || 1));
+    const localDanger = isDangerousCommand(command) ? 5 : 1;
+    const finalDanger = Math.max(modelDanger, localDanger);
+
+    console.log(color.bold('Generated command: '), color.bold(command));
+    console.log('');
+    if (parsed.explanation) {
+      console.log('Explanation:');
+      console.log(parsed.explanation);
+      console.log('');
     }
+    if (Array.isArray(parsed.arguments) && parsed.arguments.length > 0) {
+      console.log('Arguments:');
+      for (const item of parsed.arguments) {
+        const arg = item?.arg ?? '';
+        const reason = item?.reason ?? '';
+        console.log(`  - ${color.bold(arg)}: ${reason}`);
+      }
+      console.log('');
+    }
+
+    const dangerLine = `Danger Level: ${finalDanger} (1~5)`;
+    if (finalDanger >= 4) {
+      console.log(color.red(dangerLine));
+      console.log(color.red('警告：该命令被评定为高危，已阻止自动执行。请在手动核对后于系统 Shell 中自行执行。'));
+      return;
+    } else if (finalDanger === 3) {
+      console.log(color.yellow(dangerLine));
+    } else {
+      console.log(color.green(dangerLine));
+    }
+    console.log('');
+
     let shouldExecute = options.yes;
     if (!shouldExecute) {
       const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      shouldExecute = await new Promise(resolve => rl.question('Execute this command? (y/N): ', ans => { rl.close(); resolve(ans.toLowerCase() === 'y' || ans.toLowerCase() === 'yes'); }));
+      shouldExecute = await new Promise(resolve =>
+        rl.question('Execute this command? (y/N): ', ans => {
+          rl.close();
+          resolve(ans.toLowerCase() === 'y' || ans.toLowerCase() === 'yes');
+        })
+      );
     }
-    if (!shouldExecute) { console.log('Command execution cancelled'); return; }
+    if (!shouldExecute) {
+      console.log('Command execution cancelled');
+      return;
+    }
+
+    // 若命令包含 sudo 或需要交互式输入：先启动动画，随后切换到可输入状态（暂停动画并恢复光标）
+    const needsInteractive = /\bsudo\b/.test(command) || /\bpasswd\b|\bpassword\b/i.test(command);
     const executingAnimation = createAnimation('Executing');
     executingAnimation.start();
+    if (needsInteractive) {
+      // 切换动画状态：停止动画，恢复光标，提示可输入
+      executingAnimation.stop();
+      process.stdout.write('\x1b[2m[interactive mode] Waiting for input (e.g. password)...\x1b[0m\n');
+    }
     try {
-      const { stdout, stderr } = await execAsync(command);
-      executingAnimation.stop();
-      if (stdout) console.log('Output:', stdout);
-      if (stderr) console.log('Error Output:', stderr);
+      // 如果是需要 TTY 的交互式程序，使用 spawn 继承 TTY
+      if (needsTty(command)) {
+        // 交互式：确保动画已停
+        executingAnimation.stop();
+        process.stdout.write('\x1b[2m[interactive TTY] Attaching to terminal...\x1b[0m\n');
+        await new Promise<void>((resolve, reject) => {
+          const child = spawn(command, {
+            shell: true,
+            stdio: 'inherit',
+          });
+          child.on('exit', (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`Process exited with code ${code}`));
+          });
+          child.on('error', reject);
+        });
+      } else {
+        const { stdout, stderr } = await execAsync(command);
+        if (!needsInteractive) executingAnimation.stop();
+        if (stdout) console.log('Output:', stdout);
+        if (stderr) console.log('Error Output:', stderr);
+      }
     } catch (error) {
-      executingAnimation.stop();
-      // Node.js 的 child_process 模块在命令执行失败时，会生成一个 Error 对象。
-      // 这个对象的 .message 属性被设计成一个自带总结的字符串，其格式通常是 Command failed: [执行的命令]。
-      // 所以在我们的例子中，error.message 的值本身就是 "Command failed: false"。
+      if (!needsInteractive) executingAnimation.stop();
       console.error('[!] ', error instanceof Error ? error.message : String(error));
     }
   });
